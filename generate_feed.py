@@ -4,12 +4,13 @@ from __future__ import annotations
 import argparse
 import hashlib
 import html as html_lib
+import mimetypes
 import os
 import re
 from datetime import datetime, timezone
 from email.utils import format_datetime
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import xml.etree.ElementTree as ET
 
 import requests
@@ -29,6 +30,9 @@ FEED_DESCRIPTION = os.getenv(
 )
 FEED_URL = os.getenv("RSS_FEED_URL", "").strip()
 
+MEDIA_NS = "http://search.yahoo.com/mrss/"
+CONTENT_NS = "http://purl.org/rss/1.0/modules/content/"
+
 MONTH_RE = re.compile(
     r"\b(?:ene(?:ro)?|feb(?:rero)?|mar(?:zo)?|abr(?:il)?|may(?:o)?|jun(?:io)?|"
     r"jul(?:io)?|ago(?:sto)?|sep(?:t(?:iembre)?)?|sept(?:iembre)?|oct(?:ubre)?|"
@@ -37,6 +41,7 @@ MONTH_RE = re.compile(
 )
 DATE_START_RE = re.compile(r"^\s*\d{1,2}\b")
 HEADING_NAMES = {"h2", "h3", "h4"}
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
 
 
 def normalize_space(value: str) -> str:
@@ -62,7 +67,7 @@ def fetch_source(url: str) -> bytes:
     session.headers.update(
         {
             "User-Agent": (
-                "pca-agenda-rss/1.0 (+GitHub Pages RSS generator; "
+                "pca-agenda-rss/1.1 (+GitHub Pages RSS generator; "
                 "contact via repository issues)"
             )
         }
@@ -72,19 +77,59 @@ def fetch_source(url: str) -> bytes:
     return response.content
 
 
-def _next_event_link(heading: Tag, source_url: str) -> tuple[str, str] | None:
-    """Find the first meaningful anchor after a date heading, before the next heading."""
+def _image_url_from_tag(tag: Tag, source_url: str) -> str | None:
+    """Return a usable image URL from an <img> tag, if present."""
+    for attr in ("src", "data-src", "data-lazy-src", "data-original"):
+        value = (tag.get(attr) or "").strip()
+        if value and not value.startswith("data:"):
+            return urljoin(source_url, value)
+
+    srcset = (tag.get("srcset") or "").strip()
+    if srcset:
+        # Pick the last candidate, which is commonly the largest one.
+        candidates = [part.strip().split()[0] for part in srcset.split(",") if part.strip()]
+        if candidates:
+            return urljoin(source_url, candidates[-1])
+    return None
+
+
+def _looks_like_image_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return any(path.endswith(ext) for ext in IMAGE_EXTENSIONS)
+
+
+def _event_data_after_heading(heading: Tag, source_url: str) -> dict[str, str] | None:
+    """Find event link and its preceding image, stopping at the next heading."""
+    image_url: str | None = None
     node = heading.find_next()
+
     while node is not None:
         if isinstance(node, Tag):
             if node is not heading and node.name in HEADING_NAMES:
                 return None
+
+            if node.name == "img" and image_url is None:
+                image_url = _image_url_from_tag(node, source_url)
+
             if node.name == "a":
                 href = (node.get("href") or "").strip()
                 title = normalize_space(node.get_text(" ", strip=True))
-                # Image-only anchors have no textual content via get_text(), so they are skipped.
+
+                # Some PCA images are wrapped in a link pointing directly to the image.
+                if image_url is None and href:
+                    nested_img = node.find("img")
+                    if nested_img is not None:
+                        image_url = _image_url_from_tag(nested_img, source_url)
+                    elif _looks_like_image_url(urljoin(source_url, href)) and not title:
+                        image_url = urljoin(source_url, href)
+
+                # Image-only anchors have no text and are intentionally skipped as event links.
                 if href and title and not title.lower().startswith("histórico"):
-                    return title, urljoin(source_url, href)
+                    event = {"title": title, "url": urljoin(source_url, href)}
+                    if image_url:
+                        event["image"] = image_url
+                    return event
+
         node = node.find_next()
     return None
 
@@ -99,16 +144,21 @@ def extract_events(document: str | bytes, source_url: str = SOURCE_URL) -> list[
         if not looks_like_event_date(date_text):
             continue
 
-        found = _next_event_link(heading, source_url)
+        found = _event_data_after_heading(heading, source_url)
         if not found:
             continue
 
-        title, url = found
+        title = found["title"]
+        url = found["url"]
         key = (date_text.casefold(), title.casefold(), url)
         if key in seen:
             continue
         seen.add(key)
-        events.append({"date": date_text, "title": title, "url": url})
+
+        event = {"date": date_text, "title": title, "url": url}
+        if found.get("image"):
+            event["image"] = found["image"]
+        events.append(event)
 
     return events
 
@@ -116,6 +166,30 @@ def extract_events(document: str | bytes, source_url: str = SOURCE_URL) -> list[
 def stable_guid(event: dict[str, str]) -> str:
     raw = f"{EVENT_YEAR}\n{event['date']}\n{event['title']}\n{event['url']}".encode("utf-8")
     return "urn:sha256:" + hashlib.sha256(raw).hexdigest()
+
+
+def image_mime_type(url: str) -> str:
+    guessed, _ = mimetypes.guess_type(urlparse(url).path)
+    return guessed or "image/jpeg"
+
+
+def event_html(event: dict[str, str]) -> str:
+    title = html_lib.escape(event["title"], quote=True)
+    url = html_lib.escape(event["url"], quote=True)
+    date = html_lib.escape(event["date"], quote=True)
+    parts: list[str] = []
+
+    image = event.get("image")
+    if image:
+        image_escaped = html_lib.escape(image, quote=True)
+        parts.append(
+            f'<p><a href="{url}"><img src="{image_escaped}" alt="{title}" '
+            'style="max-width:100%;height:auto"></a></p>'
+        )
+
+    parts.append(f"<p><strong>Fecha del evento:</strong> {date} de {EVENT_YEAR}.</p>")
+    parts.append(f'<p><a href="{url}">Ver evento en la web del PCA</a></p>')
+    return "".join(parts)
 
 
 def indent_xml(element: ET.Element, level: int = 0) -> None:
@@ -136,6 +210,9 @@ def build_rss(events: list[dict[str, str]], source_url: str = SOURCE_URL) -> byt
         raise ValueError("No se encontraron eventos; se cancela para no publicar un feed vacío.")
 
     ET.register_namespace("atom", "http://www.w3.org/2005/Atom")
+    ET.register_namespace("media", MEDIA_NS)
+    ET.register_namespace("content", CONTENT_NS)
+
     rss = ET.Element("rss", {"version": "2.0"})
     channel = ET.SubElement(rss, "channel")
     ET.SubElement(channel, "title").text = FEED_TITLE
@@ -156,10 +233,21 @@ def build_rss(events: list[dict[str, str]], source_url: str = SOURCE_URL) -> byt
         ET.SubElement(item, "link").text = event["url"]
         guid = ET.SubElement(item, "guid", {"isPermaLink": "false"})
         guid.text = stable_guid(event)
-        ET.SubElement(item, "description").text = (
-            f"Fecha del evento: {event['date']} de {EVENT_YEAR}. "
-            "Fuente: Agenda PCA."
-        )
+
+        html_content = event_html(event)
+        ET.SubElement(item, "description").text = html_content
+        ET.SubElement(item, f"{{{CONTENT_NS}}}encoded").text = html_content
+
+        image = event.get("image")
+        if image:
+            media_type = image_mime_type(image)
+            ET.SubElement(
+                item,
+                f"{{{MEDIA_NS}}}content",
+                {"url": image, "medium": "image", "type": media_type},
+            )
+            ET.SubElement(item, f"{{{MEDIA_NS}}}thumbnail", {"url": image})
+
         ET.SubElement(item, "category").text = "Agenda PCA"
         source = ET.SubElement(item, "source", {"url": source_url})
         source.text = "Agenda PCA 2026"
@@ -168,7 +256,7 @@ def build_rss(events: list[dict[str, str]], source_url: str = SOURCE_URL) -> byt
     return ET.tostring(rss, encoding="utf-8", xml_declaration=True)
 
 
-def build_index(event_count: int, source_url: str = SOURCE_URL) -> str:
+def build_index(event_count: int, image_count: int, source_url: str = SOURCE_URL) -> str:
     generated = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     source = html_lib.escape(source_url, quote=True)
     return f"""<!doctype html>
@@ -187,7 +275,7 @@ def build_index(event_count: int, source_url: str = SOURCE_URL) -> str:
   <h1>{html_lib.escape(FEED_TITLE)}</h1>
   <p>Feed RSS generado automáticamente desde la agenda pública del PCA.</p>
   <p><a href=\"feed.xml\">Abrir feed.xml</a> · <a href=\"{source}\">Ver agenda original</a></p>
-  <p>Eventos detectados: <strong>{event_count}</strong>.</p>
+  <p>Eventos detectados: <strong>{event_count}</strong>. Eventos con imagen: <strong>{image_count}</strong>.</p>
   <p>Última generación: <code>{generated}</code>.</p>
 </body>
 </html>
@@ -210,14 +298,16 @@ def main() -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_bytes(build_rss(events, args.url))
 
+    image_count = sum(1 for event in events if event.get("image"))
     index_path = Path(args.index)
     index_path.parent.mkdir(parents=True, exist_ok=True)
-    index_path.write_text(build_index(len(events), args.url), encoding="utf-8")
+    index_path.write_text(build_index(len(events), image_count, args.url), encoding="utf-8")
     (index_path.parent / ".nojekyll").touch()
 
-    print(f"OK: {len(events)} eventos -> {output_path}")
+    print(f"OK: {len(events)} eventos ({image_count} con imagen) -> {output_path}")
     for event in events[:5]:
-        print(f" - {event['date']}: {event['title']}")
+        suffix = f" | imagen: {event['image']}" if event.get("image") else " | sin imagen"
+        print(f" - {event['date']}: {event['title']}{suffix}")
     return 0
 
 

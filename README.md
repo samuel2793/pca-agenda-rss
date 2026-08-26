@@ -11,7 +11,15 @@ No necesita servidor propio. **GitHub Actions** descarga y procesa la agenda y *
 - `feed.xml`: RSS consumible por Feedly, FreshRSS, Miniflux, NetNewsWire, etc.
 - `index.html`: página mínima con enlace al feed y la hora de la última generación.
 
-El parser busca encabezados que parezcan fechas (`11 Sept`, `7-8 Oct`, `10&15 Abr`, `29 Ene - 5 Feb`, etc.) y toma el primer enlace de texto del evento que aparece antes del siguiente encabezado. Los enlaces que contienen únicamente una imagen se ignoran.
+El parser busca encabezados que parezcan fechas (`11 Sept`, `7-8 Oct`, `10&15 Abr`, `29 Ene - 5 Feb`, etc.), extrae la imagen del cartel cuando aparece antes del enlace del evento y toma el primer enlace de texto del evento antes del siguiente encabezado.
+
+Las imágenes se publican de tres formas para maximizar compatibilidad con lectores RSS:
+
+- `media:content`
+- `media:thumbnail`
+- `<img>` dentro de `description` y `content:encoded`
+
+Si un evento no tiene imagen en la página de agenda, el elemento RSS se publica normalmente pero sin imagen.
 
 ## Puesta en marcha
 
@@ -86,4 +94,3 @@ Esto crea `site/feed.xml` y `site/index.html`.
 ## Fallos seguros
 
 Si la web cambia de estructura y el scraper deja de detectar eventos, el proceso termina con error y **no despliega un feed vacío**. Así el último RSS válido permanece publicado en Pages hasta que se adapte el parser.
-# pca-agenda-rss
